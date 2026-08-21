@@ -1,0 +1,11 @@
+[Unit]
+Description=Exa-backed web_search adapter for Grok Build (Responses API on 127.0.0.1:8390)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/wraient/.local/share/muse-filter/exa_search_adapter.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
