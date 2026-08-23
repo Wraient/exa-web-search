@@ -3,7 +3,7 @@ Description=Exa-backed web_search adapter for Grok Build (Responses API on 127.0
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/wraient/.local/share/muse-filter/exa_search_adapter.py
+ExecStart=/usr/bin/python3 %h/.local/share/muse-filter/exa_search_adapter.py
 Restart=always
 RestartSec=3
 

@@ -23,7 +23,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mcp_web_search import call_with_rotation  # noqa: E402  (rotation engine)
+from mcp_web_search import call_with_rotation  # rotation engine
 
 PORT = int(os.environ.get("EXA_ADAPTER_PORT", "8390"))
 LOG = os.path.expanduser("~/.local/share/muse-filter/exa_adapter.log")

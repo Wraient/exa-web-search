@@ -21,7 +21,15 @@ Key pool / rotation:
 - Exa exposes NO balance/credits API (admin endpoints don't exist), so refill
   detection is necessarily probe-based.
 """
-import json, os, re, sys, time, urllib.request, urllib.error, urllib.parse
+import json
+import os
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 EXA_MCP_URL = "https://mcp.exa.ai/mcp"
 ENV_FILE = os.path.expanduser("~/.config/web-search-proxy/env")
@@ -34,6 +42,9 @@ INVALID_RETRY = 86400      # invalid key: recheck once a day
 QPS_BACKOFF = 15           # 429: brief cooldown on that key only
 TRANSIENT_BACKOFF = 60     # network/5xx penalty before key is retried
 UA = "web-search-proxy/2.1"  # Exa's edge 403s bare Python-urllib UA
+
+# Adapter runs ThreadingHTTPServer; rotation state is read-modify-write JSON.
+_ROTATE_LOCK = threading.Lock()
 
 
 # ---------- config / state ----------
@@ -149,12 +160,15 @@ def _extract_text(body):
             texts = [c.get("text", "") for c in contents if isinstance(c, dict)]
             text = "\n".join(t for t in texts if t)
             if text:
-                # Exa wraps upstream errors: "... error (401): Invalid API key"
-                m = re.search(r"error \((\d{3})\)", text)
+                # Exa wraps upstream errors at the start of the text:
+                # "web_search_exa error (401): Invalid API key". Anchor to the
+                # head so ordinary result content mentioning "error (404)"
+                # is not misread as an API failure.
+                m = re.search(r"^(?:\w+ )?error \((\d{3})\)", text)
                 if result.get("isError") or m:
                     return text, True, int(m.group(1)) if m else None, text[:300]
                 return text, False, None, None
-        if "error" in msg and msg["error"]:
+        if msg.get("error"):
             return "", True, None, str(msg["error"])[:300]
     return "", False, None, "no content in response"
 
@@ -170,78 +184,95 @@ def _attempt(url, tool, args):
     text, is_err, embed_code, detail = _extract_text(body)
     if not is_err and text:
         return True, text, None, None
-    code = embed_code if embed_code is not None else (status if isinstance(status, int) else None)
+    code = embed_code if embed_code is not None else (status if isinstance(status, int) and status >= 400 else None)
     if code is None:
         code = 500
-        detail = detail or "unclassified"
+        detail = detail or "unclassified empty reply"
     return False, text, code, (detail or text)[:300]
 
 
 # ---------- rotation engine ----------
 
 def call_with_rotation(tool, args):
-    """Try configured keys round-robin; fall back to keyless. Returns final text."""
+    """Try configured keys round-robin; fall back to keyless. Returns final text.
+
+    The lock guards only the shared-state read/modify/write; network calls run
+    outside it so concurrent requests (the adapter is a threaded server) do not
+    serialize behind a slow upstream search.
+    """
     keys = load_keys()
-    state = load_state()
     now = time.time()
 
-    # prune state entries for removed keys, remember cursor
-    live = set(keys)
-    cursor = int(state.get("_cursor", 0)) % max(len(keys), 1)
-    for k in [k for k in state if k not in live and k != "_cursor"]:
-        del state[k]
+    with _ROTATE_LOCK:
+        state = load_state()
+        live = set(keys)
+        for k in [k for k in state if k not in live and k != "_cursor"]:
+            del state[k]
+        cursor = int(state.get("_cursor", 0)) % max(len(keys), 1)
+        # snapshot per-key cooldowns; two racing callers may pick the same key,
+        # which is harmless (round-robin stays approximately fair, state stays
+        # consistent because each mutation re-reads under the lock)
+        plan = []
+        for key in ([keys[(cursor + i) % len(keys)] for i in range(len(keys))]
+                    if keys else []):
+            st = state.setdefault(key, {"status": "active", "retry_at": 0, "ok": 0,
+                                        "fail": 0, "recovered": 0, "last_error": "",
+                                        "last_used": 0})
+            plan.append((key, st.get("status") == "exhausted",
+                         now < st.get("retry_at", 0), st.get("status", "active"),
+                         st.get("retry_at", 0)))
+        if plan:
+            save_state(state)
 
     notes = []
-    used_fallback = False
-    order = [keys[(cursor + i) % len(keys)] for i in range(len(keys))] if keys else []
-
-    for key in order:
-        st = state.setdefault(key, {"status": "active", "retry_at": 0, "ok": 0,
-                                    "fail": 0, "recovered": 0, "last_error": "",
-                                    "last_used": 0})
-        was_exhausted = st.get("status") == "exhausted"
-        if now < st.get("retry_at", 0):
-            notes.append(f"{mask(key)}: cooling ({st['status']}, "
-                         f"{human_delta(st['retry_at'] - now)})")
+    for key, was_exhausted, cooling, status, retry_at in plan:
+        if cooling:
+            notes.append(f"{mask(key)}: cooling ({status}, "
+                         f"{human_delta(retry_at - now)})")
             continue
 
         url = f"{EXA_MCP_URL}?exaApiKey={urllib.parse.quote(key)}"
         ok, text, code, detail = _attempt(url, tool, args)
-        st["last_used"] = now
 
+        with _ROTATE_LOCK:
+            state = load_state()
+            st = state.setdefault(key, {"status": "active", "retry_at": 0, "ok": 0,
+                                        "fail": 0, "recovered": 0, "last_error": "",
+                                        "last_used": 0})
+            st["last_used"] = now
+            if ok:
+                st["status"] = "active"
+                st["retry_at"] = 0
+                st["ok"] += 1
+                if was_exhausted:
+                    st["recovered"] += 1  # credits refilled; probe succeeded
+                st["last_error"] = ""
+                state["_cursor"] = (keys.index(key) + 1) % len(keys)
+                save_state(state)
+            else:
+                st["fail"] += 1
+                st["last_error"] = f"{code}: {detail}" if detail else str(code)
+                if code == 401:
+                    st["status"] = "invalid"
+                    st["retry_at"] = now + INVALID_RETRY
+                elif code == 402:
+                    st["status"] = "exhausted"
+                    st["retry_at"] = now + PROBE_INTERVAL
+                elif code == 429:
+                    st["status"] = "active"      # healthy, just throttled this second
+                    st["retry_at"] = now + QPS_BACKOFF
+                else:
+                    st["status"] = "active"
+                    st["retry_at"] = now + TRANSIENT_BACKOFF
+                save_state(state)
         if ok:
-            st["status"] = "active"
-            st["retry_at"] = 0
-            st["ok"] += 1
-            if was_exhausted:
-                st["recovered"] += 1  # credits refilled; probe succeeded
-            st["last_error"] = ""
-            state["_cursor"] = (keys.index(key) + 1) % len(keys)
-            save_state(state)
             prefix = f"[key {mask(key)} recovered - credits refilled]\n" if was_exhausted else ""
             return prefix + text
-
-        st["fail"] += 1
-        st["last_error"] = f"{code}: {detail}" if detail else str(code)
-        if code == 401:
-            st["status"] = "invalid"
-            st["retry_at"] = now + INVALID_RETRY
-        elif code == 402:
-            st["status"] = "exhausted"
-            st["retry_at"] = now + PROBE_INTERVAL
-        elif code == 429:
-            st["status"] = "active"          # healthy, just throttled this second
-            st["retry_at"] = now + QPS_BACKOFF
-        else:
-            st["status"] = "active"
-            st["retry_at"] = now + TRANSIENT_BACKOFF
-        save_state(state)
         notes.append(f"{mask(key)}: fail {code} ({(detail or '')[:80]})")
 
     # no usable key produced a result -> keyless fallback
     used_fallback = bool(keys)
     ok, text, code, detail = _attempt(EXA_MCP_URL, tool, args)
-    save_state(state)
     if ok:
         prefix = "[all API keys unavailable - served keyless]\n" if used_fallback else ""
         return prefix + text
@@ -261,7 +292,7 @@ def key_status():
     src = "env var EXA_API_KEYS" if os.environ.get("EXA_API_KEYS") else (
         ENV_FILE if os.path.isfile(ENV_FILE) else "(none)")
     out = [f"Exa key pool: {len(keys)} key(s), source: {src}",
-           f"keyless fallback: enabled (free tier)", ""]
+           "keyless fallback: enabled (free tier)", ""]
     if not keys:
         out.append("no keys configured - running keyless only")
     for i, key in enumerate(keys):
