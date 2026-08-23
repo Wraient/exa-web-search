@@ -81,14 +81,24 @@ def load_state():
         return {}
 
 
+_STATE_WARNED = False
+
+
 def save_state(state):
+    global _STATE_WARNED
     tmp = STATE_FILE + ".tmp"
     try:
+        # Auto-create the parent dir so a bare script run (no install.sh)
+        # still persists rotation state instead of silently dropping it.
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
-    except OSError:
-        pass
+    except OSError as e:
+        if not _STATE_WARNED:
+            _STATE_WARNED = True
+            sys.stderr.write(
+                f"web-search-proxy: cannot persist state to {STATE_FILE}: {e}\n")
 
 
 def mask(key):
@@ -161,10 +171,11 @@ def _extract_text(body):
             text = "\n".join(t for t in texts if t)
             if text:
                 # Exa wraps upstream errors at the start of the text:
-                # "web_search_exa error (401): Invalid API key". Anchor to the
-                # head so ordinary result content mentioning "error (404)"
-                # is not misread as an API failure.
-                m = re.search(r"^(?:\w+ )?error \((\d{3})\)", text)
+                # "web_search_exa error (401): Invalid API key". Anchor to
+                # the head and whitelist only exa tool-name prefixes so
+                # result content like "HTTP error (404): Not Found" at the
+                # start of a page is not misread as an API failure.
+                m = re.search(r"^(?:(?:web_search_exa|web_fetch_exa) )?error \((\d{3})\)", text)
                 if result.get("isError") or m:
                     return text, True, int(m.group(1)) if m else None, text[:300]
                 return text, False, None, None

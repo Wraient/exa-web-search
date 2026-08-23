@@ -15,8 +15,10 @@ was misclassified as an Exa API failure, benching a healthy key for 60 s and
 forcing rotation to another key. Exa's real error wrapper looks like
 `web_search_exa error (401): Invalid API key` at the **start** of the text.
 
-Now: `re.search(r"^(?:\w+ )?error \((\d{3})\)", text)` — matches only the
-toolname-prefixed error at the head of the reply.
+Now: `re.search(r"^(?:(?:web_search_exa|web_fetch_exa) )?error \((\d{3})\)", text)`
+— matches only a bare or exa-toolname-prefixed error at the head of the reply
+(round-2 tightening: the earlier `(?:\w+ )?` prefix alternative still matched
+page content *starting* with e.g. `HTTP error (404): Not Found`).
 
 ### 2. Made key-rotation state thread-safe (bug fix)
 
@@ -55,20 +57,35 @@ path applies.
 `systemd/exa-search-adapter.service`: hard-coded `/home/wraient/...` path
 replaced with `%h` (systemd's home placeholder) so the unit works for any user.
 
+### Round 2 fixes (review follow-up)
+
+- `save_state()` now `os.makedirs` the state-file parent dir (bare script run
+  without `install.sh` used to silently drop all rotation state) and warns
+  once on stderr if persistence is still impossible instead of failing silent.
+- Adapter caps request bodies at 1 MiB (`413` above that); previously read an
+  unbounded `Content-Length`.
+- Test file: replaced bare `open()` calls with context managers / helpers
+  (SIM115), so `ruff check .` really reports only the 6 intentional BLE001.
+
 ## How it was verified
 
-New test suite `test_web_search.py` (25 tests, no external deps beyond stdlib;
+New test suite `test_web_search.py` (31 tests, no external deps beyond stdlib;
 run `python3 test_web_search.py` — mocks `_http_post`, so no keys or network
 are needed):
 
 - `_extract_text`: benign content containing `error (404)` NOT an error;
   real `web_search_exa error (401)` and bare `error (402)` classified;
-  SSE parsing; jsonrpc top-level error; garbage body.
+  `web_fetch_exa error (402)` classified; non-exa `HTTP error (404)` at the
+  head of a page NOT classified; SSE parsing; jsonrpc top-level error;
+  garbage body.
 - Rotation: round-robin across keys, 401 benches key (invalid), cooling keys
   skip to keyless fallback with prefix, removed-key state pruning.
 - Concurrency: 20 parallel `call_with_rotation` calls → exactly 20 `ok`
   increments counted, state file remains valid JSON.
-- MCP `handle()`: tools/list, empty-query rejection, unknown tool → -32601, ping.
+- State persistence: missing parent dir auto-created; unwritable path warns
+  exactly once on stderr while the search itself still succeeds.
+- MCP `handle()`: tools/list, empty-query rejection, unknown tool → -32601,
+  ping, key_status tool output.
 - Adapter: `extract_query` (string / content-block list / empty), `_resp`
   shape and usage-total consistency.
 
@@ -86,9 +103,10 @@ updates counted). Restored, all 25 pass.
 Sequential latency unchanged (network-bound); concurrency keeps original
 throughput while state is now consistent.
 
-**Smoke**: MCP server over stdio answers initialize/tools/list/key_status/
+**Smoke**: MCP server over stdio answers initialize/tools-list/key_status/
 empty-query and survives malformed JSON; adapter boots and serves
-`/v1/models`, `/v1/responses`, health route.
+`/v1/models`, `/v1/responses` (live keyless Exa search returned real results),
+and rejects oversized bodies with `413`.
 
 Not verified: live calls to `mcp.exa.ai` (no API keys in this environment) —
 all live-path tests use a mocked transport.
@@ -96,7 +114,7 @@ all live-path tests use a mocked transport.
 ## Suggested verification steps for the reviewer
 
 ```bash
-python3 test_web_search.py          # expect: 25 passed, 0 failed
+python3 test_web_search.py          # expect: 31 passed, 0 failed
 ruff check .                        # expect: 6 BLE001 only (intentional)
 python3 -m py_compile mcp_web_search.py exa_search_adapter.py
 ```

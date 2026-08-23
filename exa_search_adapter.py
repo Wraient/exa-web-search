@@ -27,6 +27,7 @@ from mcp_web_search import call_with_rotation  # rotation engine
 
 PORT = int(os.environ.get("EXA_ADAPTER_PORT", "8390"))
 LOG = os.path.expanduser("~/.local/share/muse-filter/exa_adapter.log")
+MAX_BODY = 1 << 20  # 1 MiB cap; search queries are tiny
 
 
 def log(msg):
@@ -93,6 +94,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_BODY:
+            self._json(413, {"error": {"message": "request body too large"}})
+            return
         try:
             payload = json.loads(self.rfile.read(n)) if n else {}
         except ValueError:

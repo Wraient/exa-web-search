@@ -2,7 +2,9 @@
 
 Run: python3 test_web_search.py
 """
+import contextlib
 import importlib
+import io
 import json
 import os
 import sys
@@ -48,6 +50,17 @@ err2 = {"result": {"content": [{"type": "text",
 t, e, c, d = mws._extract_text(json.dumps(err2))
 check("bare 'error (402)' at start classified 402", e and c == 402)
 
+err3 = {"result": {"content": [{"type": "text",
+        "text": "web_fetch_exa error (402): NO_MORE_CREDITS"}], "isError": True}}
+t, e, c, d = mws._extract_text(json.dumps(err3))
+check("'web_fetch_exa error (402)' classified", e and c == 402)
+
+# Non-exa word-prefixed error at the very head of a page must NOT classify.
+http_err = {"result": {"content": [{"type": "text",
+        "text": "HTTP error (404): Not Found\nThe page you requested has moved."}]}}
+t, e, c, d = mws._extract_text(json.dumps(http_err))
+check("non-exa 'HTTP error (404)' at head NOT classified", not e and c is None)
+
 t, e, c, d = mws._extract_text(sse(ok_reply))
 check("SSE-wrapped ok reply parsed, not error", (not e) and t.startswith("# Results"))
 
@@ -69,6 +82,17 @@ state_file = os.path.join(tmp, "exa_keys.json")
 mws.STATE_FILE = state_file
 mws.ENV_FILE = os.path.join(tmp, "env")
 
+
+def read_state():
+    with open(state_file) as f:
+        return json.load(f)
+
+
+def write_state(st):
+    with open(state_file, "w") as f:
+        json.dump(st, f)
+
+
 keys = ["k00000000000000001", "k00000000000000002"]
 with open(mws.ENV_FILE, "w") as f:
     f.write("EXA_API_KEYS=" + ",".join(keys) + "\n")
@@ -81,7 +105,7 @@ BAD401 = json.dumps({"result": {"content": [{"type": "text",
 with mock.patch.object(mws, "_http_post", return_value=(200, GOOD, None)) as hp:
     a = mws.call_with_rotation("web_search_exa", {"query": "q"})
     b = mws.call_with_rotation("web_search_exa", {"query": "q"})
-    st = json.load(open(state_file))
+    st = read_state()
     check("round robin: both keys used once each",
           st[keys[0]]["ok"] == 1 and st[keys[1]]["ok"] == 1)
     check("happy path returns text", a == "SEARCH-OK" == b)
@@ -91,14 +115,14 @@ with mock.patch.object(mws, "_http_post", return_value=(200, GOOD, None)) as hp:
 # 401 benches key, falls through to next key, then keyless fallback
 with mock.patch.object(mws, "_http_post", return_value=(200, BAD401, None)):
     out = mws.call_with_rotation("web_search_exa", {"query": "q"})
-    st = json.load(open(state_file))
+    st = read_state()
     check("401 marks key invalid", st[keys[0]]["status"] == "invalid")
 
 # All keys cooling -> keyless fallback used, result prefixed
 for k in keys:
-    st = json.load(open(state_file))
+    st = read_state()
     st[k]["retry_at"] = time.time() + 9999
-    json.dump(st, open(state_file, "w"))
+    write_state(st)
 with mock.patch.object(mws, "_http_post", return_value=(200, GOOD, None)) as hp:
     out = mws.call_with_rotation("web_search_exa", {"query": "q"})
     check("cooling keys -> keyless fallback with prefix",
@@ -106,30 +130,53 @@ with mock.patch.object(mws, "_http_post", return_value=(200, GOOD, None)) as hp:
     check("keyless call has no api key param", "exaApiKey" not in hp.call_args.args[0])
 
 # state pruning of removed keys
-st = json.load(open(state_file))
+st = read_state()
 st["REMOVEDKEY"] = {"status": "active"}
-json.dump(st, open(state_file, "w"))
+write_state(st)
 with mock.patch.object(mws, "_http_post", return_value=(200, GOOD, None)):
     mws.call_with_rotation("web_search_exa", {"query": "q"})
-st = json.load(open(state_file))
+st = read_state()
 check("state entries for removed keys pruned", "REMOVEDKEY" not in st)
 
 # ---- concurrency: parallel rotations must not corrupt state ----
-st = json.load(open(state_file))
+st = read_state()
 for k in keys:
     st[k] = {"status": "active", "retry_at": 0, "ok": 0, "fail": 0,
              "recovered": 0, "last_error": "", "last_used": 0}
-json.dump(st, open(state_file, "w"))
+write_state(st)
 with mock.patch.object(mws, "_http_post", return_value=(200, GOOD, None)):
     threads = [threading.Thread(target=mws.call_with_rotation,
                                 args=("web_search_exa", {"query": "q"}))
                for _ in range(20)]
     [t_.start() for t_ in threads]
     [t_.join() for t_ in threads]
-st = json.load(open(state_file))
+st = read_state()
 total_ok = st[keys[0]]["ok"] + st[keys[1]]["ok"]
 check(f"20 concurrent calls -> all 20 counted (got {total_ok})", total_ok == 20)
 check("state file is valid JSON after concurrent writes", isinstance(st, dict))
+
+# ---- state persistence hardening ----
+# Missing parent dir -> auto-created instead of silent loss
+nested = os.path.join(tmp, "does", "not", "exist")
+mws.STATE_FILE = os.path.join(nested, "exa_keys.json")
+mws._STATE_WARNED = False
+with mock.patch.object(mws, "_http_post", return_value=(200, GOOD, None)):
+    mws.call_with_rotation("web_search_exa", {"query": "q"})
+check("save_state auto-creates missing parent dir", os.path.isfile(mws.STATE_FILE))
+
+# Unwritable path -> warn once on stderr, no crash, no spam
+blocked = os.path.join(tmp, "notadir")
+open(blocked, "w").close()
+mws.STATE_FILE = os.path.join(blocked, "sub", "x.json")
+mws._STATE_WARNED = False
+buf = io.StringIO()
+with mock.patch.object(mws, "_http_post", return_value=(200, GOOD, None)), \
+        contextlib.redirect_stderr(buf):
+    out = mws.call_with_rotation("web_search_exa", {"query": "q"})
+check("unwritable state path: search still succeeds", out == "SEARCH-OK")
+check("unwritable state path: warns once on stderr",
+      buf.getvalue().count("cannot persist state") == 1 and mws._STATE_WARNED)
+mws.STATE_FILE = state_file  # restore
 
 # ---- MCP handle() ----
 r = mws.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
@@ -142,6 +189,10 @@ r = mws.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
 check("unknown tool -> -32601", r["error"]["code"] == -32601)
 r = mws.handle({"jsonrpc": "2.0", "id": 4, "method": "ping"})
 check("ping", r["result"] == {})
+r = mws.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "key_status", "arguments": {}}})
+ks = r["result"]["content"][0]["text"]
+check("key_status tool reports pool", ks.startswith("Exa key pool:") and "2 key(s)" in ks)
 
 # ---- adapter helpers ----
 check("extract_query str", adapter.extract_query({"input": " hi "}) == "hi")
